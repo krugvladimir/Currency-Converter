@@ -1,0 +1,239 @@
+#include <iostream>
+#include <string>
+#include <map>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <ctime>
+#include <algorithm>
+#include <regex>
+#include <curl/curl.h>   // libcurl-dev, requires linking: -lcurl
+#include <nlohmann/json.hpp>  // json.hpp from nlohmann/json
+using json = nlohmann::json;
+
+// ========== Configuration ==========
+const std::string CACHE_FILE = ".cache.json";
+const long CACHE_TTL_SEC = 3600;
+const int HISTORY_SIZE = 10;
+
+const std::map<std::string, double> FALLBACK_RATES = {
+    {"USD", 1.0}, {"EUR", 0.9165}, {"GBP", 0.7923}, {"JPY", 147.88},
+    {"CAD", 1.352}, {"AUD", 1.518}, {"CHF", 0.882}, {"CNY", 7.193}, {"RUB", 91.45}
+};
+const std::map<char, std::string> SYMBOL_MAP = {{'$', "USD"}, {'€', "EUR"}, {'£', "GBP"}, {'¥', "JPY"}};
+
+// ========== HTTP Helpers ==========
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* output) {
+    size_t total = size * nmemb;
+    output->append((char*)contents, total);
+    return total;
+}
+
+std::string httpGet(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    std::string response;
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) response.clear();
+        curl_easy_cleanup(curl);
+    }
+    return response;
+}
+
+// ========== Cache & Rates ==========
+struct CacheData {
+    time_t timestamp;
+    std::map<std::string, double> rates;
+};
+
+bool loadCache(CacheData& cache) {
+    std::ifstream f(CACHE_FILE);
+    if (!f.is_open()) return false;
+    json j;
+    f >> j;
+    cache.timestamp = j["timestamp"];
+    for (auto& [k, v] : j["rates"].items()) {
+        cache.rates[k] = v;
+    }
+    return true;
+}
+
+void saveCache(const CacheData& cache) {
+    json j;
+    j["timestamp"] = cache.timestamp;
+    j["rates"] = cache.rates;
+    std::ofstream f(CACHE_FILE);
+    f << j.dump(2);
+}
+
+std::map<std::string, double> fetchRates() {
+    CacheData cache;
+    if (loadCache(cache) && (time(nullptr) - cache.timestamp) < CACHE_TTL_SEC) {
+        std::cerr << "[cache] using cached rates" << std::endl;
+        return cache.rates;
+    }
+    std::string response = httpGet("https://api.exchangerate-api.com/v4/latest/USD");
+    if (!response.empty()) {
+        try {
+            json data = json::parse(response);
+            std::map<std::string, double> rates;
+            for (auto& [k, v] : data["rates"].items()) {
+                rates[k] = v.get<double>();
+            }
+            CacheData newCache = {time(nullptr), rates};
+            saveCache(newCache);
+            std::cerr << "[api] rates updated" << std::endl;
+            return rates;
+        } catch (...) {}
+    }
+    std::cerr << "[warn] API failed, using fallback rates" << std::endl;
+    return FALLBACK_RATES;
+}
+
+// ========== Conversion ==========
+double convert(double amount, const std::string& from, const std::string& to, const std::map<std::string,double>& rates, double& outRate) {
+    if (!rates.count(from) || !rates.count(to))
+        throw std::runtime_error("Unsupported currency");
+    double rate = rates.at(to) / rates.at(from);
+    outRate = rate;
+    return amount * rate;
+}
+
+// ========== Parsing ==========
+std::string detectCurrencyFromSymbol(const std::string& s) {
+    if (s.empty()) return "";
+    for (auto& [sym, curr] : SYMBOL_MAP) {
+        if (s[0] == sym) return curr;
+    }
+    return "";
+}
+
+double parseAmount(const std::string& s) {
+    // remove leading symbol
+    std::string numPart = s;
+    if (!detectCurrencyFromSymbol(s).empty()) {
+        numPart = s.substr(1);
+    }
+    return std::stod(numPart);
+}
+
+// ========== History ==========
+struct HistoryEntry {
+    time_t timestamp;
+    std::string fromCurr, toCurr;
+    double amount, result, rate;
+};
+
+std::vector<HistoryEntry> history;
+
+void addToHistory(const HistoryEntry& entry) {
+    history.insert(history.begin(), entry);
+    if (history.size() > HISTORY_SIZE) history.pop_back();
+}
+
+void showHistory() {
+    if (history.empty()) {
+        std::cout << "История пуста" << std::endl;
+        return;
+    }
+    for (size_t i = 0; i < history.size(); ++i) {
+        auto& e = history[i];
+        char timeBuf[20];
+        struct tm* tm_info = localtime(&e.timestamp);
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", tm_info);
+        std::cout << i+1 << ") " << timeBuf << " | " << e.amount << " " << e.fromCurr << " → " 
+                  << e.toCurr << " = " << e.result << " (курс " << e.rate << ")" << std::endl;
+    }
+}
+
+// ========== Output ==========
+void formatOutput(double amount, const std::string& fromCurr, const std::string& toCurr, double result, double rate, const std::string& fmt) {
+    if (fmt == "json") {
+        json j = {{"amount", amount}, {"from", fromCurr}, {"to", toCurr}, {"result", result}, {"rate", rate}};
+        std::cout << j.dump(4) << std::endl;
+    } else if (fmt == "table") {
+        printf("%5s → %5s : %.2f = %.4f (курс %.4f)\n", fromCurr.c_str(), toCurr.c_str(), amount, result, rate);
+    } else {
+        printf("%.2f %s = %.4f %s (курс: %.4f)\n", amount, fromCurr.c_str(), result, toCurr.c_str(), rate);
+    }
+}
+
+// ========== Interactive ==========
+void interactive(const std::map<std::string,double>& rates) {
+    std::string line;
+    std::cout << "Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit" << std::endl;
+    while (true) {
+        std::cout << "> ";
+        std::getline(std::cin, line);
+        if (line == "exit") break;
+        if (line == "history") { showHistory(); continue; }
+        std::istringstream iss(line);
+        std::string first, second, third;
+        if (!(iss >> first >> second >> third)) {
+            std::cout << "Формат: <сумма> <из> <в>" << std::endl;
+            continue;
+        }
+        double amount;
+        std::string fromCurr, toCurr;
+        try {
+            amount = parseAmount(first);
+            std::string detected = detectCurrencyFromSymbol(first);
+            fromCurr = detected.empty() ? second : detected;
+            toCurr = third;
+            std::transform(fromCurr.begin(), fromCurr.end(), fromCurr.begin(), ::toupper);
+            std::transform(toCurr.begin(), toCurr.end(), toCurr.begin(), ::toupper);
+            double rate;
+            double result = convert(amount, fromCurr, toCurr, rates, rate);
+            formatOutput(amount, fromCurr, toCurr, result, rate, "text");
+            addToHistory({time(nullptr), fromCurr, toCurr, amount, result, rate});
+        } catch (const std::exception& e) {
+            std::cout << "Ошибка: " << e.what() << std::endl;
+        }
+    }
+}
+
+// ========== Main ==========
+int main(int argc, char* argv[]) {
+    std::vector<std::string> args(argv+1, argv+argc);
+    std::string fmt = "text";
+    bool interactiveMode = false;
+    for (auto it = args.begin(); it != args.end(); ) {
+        if (*it == "--json") { fmt = "json"; it = args.erase(it); }
+        else if (*it == "--table") { fmt = "table"; it = args.erase(it); }
+        else if (*it == "interactive") { interactiveMode = true; it = args.erase(it); }
+        else ++it;
+    }
+    
+    auto rates = fetchRates();
+    
+    if (interactiveMode) {
+        interactive(rates);
+        return 0;
+    }
+    
+    if (args.size() < 3) {
+        std::cerr << "Usage: converter [--json|--table] <amount> <from> <to>   or   converter interactive" << std::endl;
+        return 1;
+    }
+    
+    try {
+        double amount = parseAmount(args[0]);
+        std::string fromCurr = detectCurrencyFromSymbol(args[0]);
+        if (fromCurr.empty()) fromCurr = args[1];
+        std::string toCurr = args[2];
+        std::transform(fromCurr.begin(), fromCurr.end(), fromCurr.begin(), ::toupper);
+        std::transform(toCurr.begin(), toCurr.end(), toCurr.begin(), ::toupper);
+        double rate;
+        double result = convert(amount, fromCurr, toCurr, rates, rate);
+        formatOutput(amount, fromCurr, toCurr, result, rate, fmt);
+        addToHistory({time(nullptr), fromCurr, toCurr, amount, result, rate});
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
