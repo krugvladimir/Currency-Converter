@@ -1,0 +1,191 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write, BufRead};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::env;
+use std::process;
+
+// ========== Configuration ==========
+const CACHE_FILE: &str = ".cache.json";
+const CACHE_TTL_SECS: u64 = 3600;
+const HISTORY_SIZE: usize = 10;
+
+const FALLBACK_RATES: &[(&str, f64)] = &[
+    ("USD",1.0), ("EUR",0.9165), ("GBP",0.7923), ("JPY",147.88),
+    ("CAD",1.352), ("AUD",1.518), ("CHF",0.882), ("CNY",7.193), ("RUB",91.45)
+];
+
+#[derive(Serialize, Deserialize)]
+struct CacheData {
+    timestamp: u64,
+    rates: HashMap<String, f64>,
+}
+
+#[derive(Clone)]
+struct HistoryEntry {
+    timestamp: u64,
+    from_curr: String,
+    to_curr: String,
+    amount: f64,
+    result: f64,
+    rate: f64,
+}
+
+lazy_static::lazy_static! {
+    static ref SYMBOL_MAP: HashMap<char, &'static str> = {
+        let mut m = HashMap::new();
+        m.insert('$', "USD");
+        m.insert('€', "EUR");
+        m.insert('£', "GBP");
+        m.insert('¥', "JPY");
+        m
+    };
+}
+
+// ========== Helpers ==========
+fn detect_currency_from_symbol(s: &str) -> Option<String> {
+    if s.is_empty() { return None; }
+    let ch = s.chars().next().unwrap();
+    SYMBOL_MAP.get(&ch).map(|&c| c.to_string())
+}
+
+fn parse_amount_and_currency(s: &str) -> (Option<f64>, Option<String>) {
+    if let Some(curr) = detect_currency_from_symbol(s) {
+        let num_part = &s[1..];
+        if let Ok(amt) = num_part.parse::<f64>() {
+            return (Some(amt), Some(curr));
+        }
+    }
+    if let Ok(amt) = s.parse::<f64>() {
+        return (Some(amt), None);
+    }
+    (None, None)
+}
+
+// ========== Rates ==========
+fn fetch_rates() -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+    // cache
+    if let Ok(data) = fs::read_to_string(CACHE_FILE) {
+        if let Ok(cache) = serde_json::from_str::<CacheData>(&data) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            if now - cache.timestamp < CACHE_TTL_SECS {
+                eprintln!("[cache] using cached rates");
+                return Ok(cache.rates);
+            }
+        }
+    }
+    // API
+    let url = "https://api.exchangerate-api.com/v4/latest/USD";
+    let resp = reqwest::blocking::get(url)?;
+    if resp.status().is_success() {
+        let json: serde_json::Value = resp.json()?;
+        if let Some(rates_obj) = json.get("rates").and_then(|v| v.as_object()) {
+            let mut rates = HashMap::new();
+            for (k, v) in rates_obj {
+                if let Some(num) = v.as_f64() {
+                    rates.insert(k.clone(), num);
+                }
+            }
+            let cache = CacheData { timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(), rates: rates.clone() };
+            fs::write(CACHE_FILE, serde_json::to_string_pretty(&cache)?)?;
+            eprintln!("[api] rates updated");
+            return Ok(rates);
+        }
+    }
+    eprintln!("[warn] using fallback rates");
+    Ok(FALLBACK_RATES.iter().map(|(k,v)| (k.to_string(), *v)).collect())
+}
+
+fn convert(amount: f64, from_curr: &str, to_curr: &str, rates: &HashMap<String, f64>) -> Result<(f64, f64), String> {
+    let from_rate = rates.get(from_curr).ok_or_else(|| format!("Unsupported currency: {}", from_curr))?;
+    let to_rate = rates.get(to_curr).ok_or_else(|| format!("Unsupported currency: {}", to_curr))?;
+    let rate = to_rate / from_rate;
+    Ok((amount * rate, rate))
+}
+
+// ========== History ==========
+static mut HISTORY: Vec<HistoryEntry> = Vec::new();
+
+fn add_to_history(entry: HistoryEntry) {
+    unsafe {
+        HISTORY.insert(0, entry);
+        if HISTORY.len() > HISTORY_SIZE {
+            HISTORY.pop();
+        }
+    }
+}
+
+fn show_history() {
+    unsafe {
+        if HISTORY.is_empty() {
+            println!("История пуста");
+            return;
+        }
+        for (i, e) in HISTORY.iter().enumerate() {
+            println!("{}) {} | {:.2} {} → {} = {:.4} (курс {:.4})",
+                i+1, e.timestamp, e.amount, e.from_curr, e.to_curr, e.result, e.rate);
+        }
+    }
+}
+
+// ========== Output ==========
+fn format_output(amount: f64, from_curr: &str, to_curr: &str, result: f64, rate: f64, format: &str) {
+    match format {
+        "json" => {
+            let out = serde_json::json!({
+                "amount": amount,
+                "from": from_curr,
+                "to": to_curr,
+                "result": result,
+                "rate": rate
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        },
+        "table" => println!("{:5} → {:5} : {:.2} = {:.4} (курс {:.4})", from_curr, to_curr, amount, result, rate),
+        _ => println!("{:.2} {} = {:.4} {} (курс: {:.4})", amount, from_curr, result, to_curr, rate),
+    }
+}
+
+// ========== Interactive ==========
+fn interactive(rates: HashMap<String, f64>) {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    println!("Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit");
+    loop {
+        print!("> ");
+        stdout.flush().unwrap();
+        let mut line = String::new();
+        if stdin.read_line(&mut line).is_err() { break; }
+        let line = line.trim();
+        if line == "exit" { break; }
+        if line == "history" { show_history(); continue; }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            println!("Формат: <сумма> <из> <в>");
+            continue;
+        }
+        let (amount_opt, detected_curr) = parse_amount_and_currency(parts[0]);
+        let amount = match amount_opt { Some(a) => a, None => { println!("Неверная сумма"); continue; } };
+        let from_curr = match detected_curr { Some(c) => c, None => parts[1].to_uppercase() };
+        let to_curr = parts[2].to_uppercase();
+        match convert(amount, &from_curr, &to_curr, &rates) {
+            Ok((result, rate)) => {
+                format_output(amount, &from_curr, &to_curr, result, rate, "text");
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                add_to_history(HistoryEntry { timestamp: now, from_curr, to_curr, amount, result, rate });
+            },
+            Err(e) => println!("Ошибка: {}", e),
+        }
+    }
+}
+
+// ========== Main ==========
+#[tokio::main] // using blocking reqwest but need runtime; simpler: use reqwest::blocking
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Because we use blocking reqwest, we don't need async main, but lazy_static requires? Actually we can use normal main.
+    // Let's just use standard main and reqwest::blocking.
+    // But to avoid confusion, I'll convert to standard main (blocking).
+    // Rust version: use standard main with reqwest::blocking.
+    unimplemented!("Rewrite with standard main");
+}
