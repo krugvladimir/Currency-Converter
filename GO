@@ -1,0 +1,216 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+	"strconv"
+	"bufio"
+)
+
+// ========== Configuration ==========
+const cacheFile = ".cache.json"
+const cacheTTL = 3600 * time.Second
+const historySize = 10
+
+var fallbackRates = map[string]float64{
+	"USD": 1, "EUR": 0.9165, "GBP": 0.7923, "JPY": 147.88,
+	"CAD": 1.352, "AUD": 1.518, "CHF": 0.882, "CNY": 7.193, "RUB": 91.45,
+}
+var symbolMap = map[rune]string{'$': "USD", '€': "EUR", '£': "GBP", '¥': "JPY"}
+
+// ========== Data Types ==========
+type cacheData struct {
+	Timestamp int64              `json:"timestamp"`
+	Rates     map[string]float64 `json:"rates"`
+}
+type historyEntry struct {
+	Timestamp int64
+	FromCurr  string
+	ToCurr    string
+	Amount    float64
+	Result    float64
+	Rate      float64
+}
+var history []historyEntry
+
+// ========== Helpers ==========
+func detectCurrencyFromSymbol(s string) string {
+	if len(s) == 0 { return "" }
+	r := []rune(s)[0]
+	if curr, ok := symbolMap[r]; ok { return curr }
+	return ""
+}
+
+func parseAmountAndCurrency(s string) (float64, string) {
+	if curr := detectCurrencyFromSymbol(s); curr != "" {
+		numPart := s[1:]
+		if amt, err := strconv.ParseFloat(numPart, 64); err == nil {
+			return amt, curr
+		}
+	}
+	amt, err := strconv.ParseFloat(s, 64)
+	if err != nil { return 0, "" }
+	return amt, ""
+}
+
+// ========== Rates Fetching ==========
+func fetchRates() (map[string]float64, error) {
+	// read cache
+	if data, err := os.ReadFile(cacheFile); err == nil {
+		var cache cacheData
+		if json.Unmarshal(data, &cache) == nil && time.Since(time.Unix(cache.Timestamp, 0)) < cacheTTL {
+			fmt.Fprintln(os.Stderr, "[cache] using cached rates")
+			return cache.Rates, nil
+		}
+	}
+	// API
+	url := "https://api.exchangerate-api.com/v4/latest/USD"
+	resp, err := http.Get(url)
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]interface{}
+		json.Unmarshal(body, &result)
+		if ratesMap, ok := result["rates"].(map[string]interface{}); ok {
+			rates := make(map[string]float64)
+			for k, v := range ratesMap {
+				rates[k] = v.(float64)
+			}
+			cache := cacheData{Timestamp: time.Now().Unix(), Rates: rates}
+			if data, _ := json.MarshalIndent(cache, "", "  "); data != nil {
+				os.WriteFile(cacheFile, data, 0644)
+			}
+			fmt.Fprintln(os.Stderr, "[api] rates updated")
+			return rates, nil
+		}
+	}
+	fmt.Fprintln(os.Stderr, "[warn] using fallback rates")
+	return fallbackRates, nil
+}
+
+func convert(amount float64, fromCurr, toCurr string, rates map[string]float64) (float64, float64, error) {
+	fromRate, okFrom := rates[fromCurr]
+	toRate, okTo := rates[toCurr]
+	if !okFrom || !okTo {
+		return 0, 0, fmt.Errorf("unsupported currency: %s or %s", fromCurr, toCurr)
+	}
+	rate := toRate / fromRate
+	return amount * rate, rate, nil
+}
+
+// ========== History ==========
+func addToHistory(e historyEntry) {
+	history = append([]historyEntry{e}, history...)
+	if len(history) > historySize {
+		history = history[:historySize]
+	}
+}
+
+func showHistory() {
+	if len(history) == 0 {
+		fmt.Println("История пуста")
+		return
+	}
+	for i, e := range history {
+		t := time.Unix(e.Timestamp, 0).Format("15:04:05")
+		fmt.Printf("%d) %s | %.2f %s → %s = %.4f (курс %.4f)\n",
+			i+1, t, e.Amount, e.FromCurr, e.ToCurr, e.Result, e.Rate)
+	}
+}
+
+// ========== Output ==========
+func formatOutput(amount float64, fromCurr, toCurr string, result, rate float64, format string) {
+	switch format {
+	case "json":
+		out := map[string]interface{}{
+			"amount": amount, "from": fromCurr, "to": toCurr,
+			"result": result, "rate": rate,
+		}
+		data, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(data))
+	case "table":
+		fmt.Printf("%5s → %5s : %.2f = %.4f (курс %.4f)\n", fromCurr, toCurr, amount, result, rate)
+	default:
+		fmt.Printf("%.2f %s = %.4f %s (курс: %.4f)\n", amount, fromCurr, result, toCurr, rate)
+	}
+}
+
+// ========== Interactive ==========
+func interactive(rates map[string]float64) {
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit")
+	for {
+		fmt.Print("> ")
+		if !scanner.Scan() { break }
+		line := strings.TrimSpace(scanner.Text())
+		if line == "exit" { break }
+		if line == "history" { showHistory(); continue }
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			fmt.Println("Формат: <сумма> <из> <в>")
+			continue
+		}
+		amount, fromCurr := parseAmountAndCurrency(parts[0])
+		if amount == 0 {
+			fmt.Println("Неверная сумма")
+			continue
+		}
+		if fromCurr == "" {
+			fromCurr = strings.ToUpper(parts[1])
+		}
+		toCurr := strings.ToUpper(parts[2])
+		result, rate, err := convert(amount, fromCurr, toCurr, rates)
+		if err != nil {
+			fmt.Println("Ошибка:", err)
+			continue
+		}
+		formatOutput(amount, fromCurr, toCurr, result, rate, "text")
+		addToHistory(historyEntry{Timestamp: time.Now().Unix(), FromCurr: fromCurr, ToCurr: toCurr, Amount: amount, Result: result, Rate: rate})
+	}
+}
+
+// ========== Main ==========
+func main() {
+	args := os.Args[1:]
+	format := "text"
+	interactiveMode := false
+	newArgs := []string{}
+	for _, a := range args {
+		if a == "--json" { format = "json" }
+		else if a == "--table" { format = "table" }
+		else if a == "interactive" { interactiveMode = true }
+		else { newArgs = append(newArgs, a) }
+	}
+	rates, err := fetchRates()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to fetch rates:", err)
+		return
+	}
+	if interactiveMode {
+		interactive(rates)
+		return
+	}
+	if len(newArgs) < 3 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--json|--table] <amount> <from> <to>   or   converter interactive\n", os.Args[0])
+		os.Exit(1)
+	}
+	amount, fromCurr := parseAmountAndCurrency(newArgs[0])
+	if amount == 0 {
+		fmt.Fprintln(os.Stderr, "Invalid amount")
+		os.Exit(1)
+	}
+	if fromCurr == "" { fromCurr = strings.ToUpper(newArgs[1]) }
+	toCurr := strings.ToUpper(newArgs[2])
+	result, rate, err := convert(amount, fromCurr, toCurr, rates)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
+	}
+	formatOutput(amount, fromCurr, toCurr, result, rate, format)
+	addToHistory(historyEntry{Timestamp: time.Now().Unix(), FromCurr: fromCurr, ToCurr: toCurr, Amount: amount, Result: result, Rate: rate})
+}
