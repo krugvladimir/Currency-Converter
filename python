@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+Currency Converter - Python version
+Features: caching, symbol detection, history, JSON output, interactive mode
+"""
+import json
+import sys
+import os
+import time
+from datetime import datetime
+from typing import Dict, Optional, Tuple, List
+import urllib.request
+import urllib.error
+
+# ========== Configuration ==========
+CACHE_FILE = ".cache.json"
+CACHE_TTL = 3600  # seconds
+HISTORY_FILE = ".history.json"
+HISTORY_SIZE = 10
+FALLBACK_RATES = {
+    "USD": 1, "EUR": 0.9165, "GBP": 0.7923, "JPY": 147.88,
+    "CAD": 1.352, "AUD": 1.518, "CHF": 0.882, "CNY": 7.193, "RUB": 91.45
+}
+SYMBOL_MAP = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
+
+# ========== Helpers ==========
+def detect_currency_from_symbol(s: str) -> Optional[str]:
+    for sym, curr in SYMBOL_MAP.items():
+        if s.startswith(sym):
+            return curr
+    return None
+
+def parse_amount_currency(arg: str) -> Tuple[Optional[float], Optional[str]]:
+    # Check symbol prefix
+    for sym, curr in SYMBOL_MAP.items():
+        if arg.startswith(sym):
+            try:
+                amount = float(arg[1:])
+                return amount, curr
+            except:
+                pass
+    # Try numeric
+    try:
+        return float(arg), None
+    except:
+        return None, arg.upper()
+
+def fetch_rates() -> Dict[str, float]:
+    # Cache
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'r') as f:
+            cache = json.load(f)
+        if time.time() - cache['timestamp'] < CACHE_TTL:
+            print("[cache] using cached rates", file=sys.stderr)
+            return cache['rates']
+    # API
+    url = "https://api.exchangerate-api.com/v4/latest/USD"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            data = json.loads(response.read().decode())
+            rates = data['rates']
+            with open(CACHE_FILE, 'w') as f:
+                json.dump({'timestamp': time.time(), 'rates': rates}, f)
+            print("[api] rates updated", file=sys.stderr)
+            return rates
+    except Exception as e:
+        print(f"[warn] API failed: {e}, using fallback rates", file=sys.stderr)
+        return FALLBACK_RATES.copy()
+
+def convert(amount: float, from_curr: str, to_curr: str, rates: Dict[str, float]) -> Tuple[float, float]:
+    if from_curr not in rates or to_curr not in rates:
+        raise ValueError(f"Unsupported currency: {from_curr} or {to_curr}")
+    rate = rates[to_curr] / rates[from_curr]
+    return amount * rate, rate
+
+def format_output(amount: float, from_curr: str, to_curr: str, result: float, rate: float, fmt: str) -> str:
+    if fmt == 'json':
+        return json.dumps({
+            "amount": amount, "from": from_curr, "to": to_curr,
+            "result": round(result, 4), "rate": round(rate, 4)
+        }, indent=2)
+    elif fmt == 'table':
+        return f"{from_curr:5} → {to_curr:5} : {amount:.2f} = {result:.4f} (курс {rate:.4f})"
+    else:
+        return f"{amount:.2f} {from_curr} = {result:.4f} {to_curr} (курс: {rate:.4f})"
+
+# ========== History Management ==========
+class History:
+    def __init__(self):
+        self.entries = []
+        self.load()
+    def add(self, from_curr: str, to_curr: str, amount: float, result: float, rate: float):
+        entry = {
+            "timestamp": time.time(),
+            "from": from_curr, "to": to_curr,
+            "amount": amount, "result": result, "rate": rate
+        }
+        self.entries.insert(0, entry)
+        if len(self.entries) > HISTORY_SIZE:
+            self.entries.pop()
+        self.save()
+    def show(self):
+        if not self.entries:
+            print("История пуста")
+            return
+        for i, e in enumerate(self.entries, 1):
+            dt = datetime.fromtimestamp(e['timestamp']).strftime("%H:%M:%S")
+            print(f"{i}) {dt} | {e['amount']} {e['from']} → {e['to']} = {e['result']:.4f} (курс {e['rate']:.4f})")
+    def save(self):
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(self.entries, f, indent=2)
+    def load(self):
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                self.entries = json.load(f)
+
+# ========== Interactive Mode ==========
+def interactive(rates: Dict[str, float], history: History):
+    print("Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit")
+    while True:
+        try:
+            cmd = input("> ").strip()
+        except EOFError:
+            break
+        if cmd == "exit":
+            break
+        if cmd == "history":
+            history.show()
+            continue
+        parts = cmd.split()
+        if len(parts) < 3:
+            print("Формат: <сумма> <из> <в>  (например: 100 USD EUR)")
+            continue
+        # Parse amount
+        amount_val, amount_curr = parse_amount_currency(parts[0])
+        if amount_val is None:
+            print("Неверная сумма")
+            continue
+        from_curr = amount_curr if amount_curr else parts[1].upper()
+        to_curr = parts[2].upper()
+        try:
+            res, rate = convert(amount_val, from_curr, to_curr, rates)
+            print(format_output(amount_val, from_curr, to_curr, res, rate, 'text'))
+            history.add(from_curr, to_curr, amount_val, res, rate)
+        except Exception as e:
+            print(f"Ошибка: {e}")
+
+# ========== CLI ==========
+def main():
+    args = sys.argv[1:]
+    fmt = 'text'
+    if '--json' in args:
+        fmt = 'json'
+        args.remove('--json')
+    if '--table' in args:
+        fmt = 'table'
+        args.remove('--table')
+    interactive_mode = 'interactive' in args
+    if interactive_mode:
+        args.remove('interactive')
+    
+    rates = fetch_rates()
+    hist = History()
+    
+    if interactive_mode:
+        interactive(rates, hist)
+        return
+    
+    if len(args) < 3:
+        print("Usage: python converter.py [--json|--table] <amount> <from> <to>   or   converter.py interactive")
+        sys.exit(1)
+    
+    amount_val, amount_curr = parse_amount_currency(args[0])
+    if amount_val is None:
+        print("Сумма не распознана")
+        sys.exit(1)
+    from_curr = amount_curr if amount_curr else args[1].upper()
+    to_curr = args[2].upper()
+    try:
+        res, rate = convert(amount_val, from_curr, to_curr, rates)
+        print(format_output(amount_val, from_curr, to_curr, res, rate, fmt))
+        hist.add(from_curr, to_curr, amount_val, res, rate)
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
