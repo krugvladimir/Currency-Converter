@@ -1,0 +1,160 @@
+// Converter.java
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.time.Instant;
+import java.util.*;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
+
+public class Converter {
+    private static final String CACHE_FILE = ".cache.json";
+    private static final long CACHE_TTL_MS = 3600000L;
+    private static final int HISTORY_SIZE = 10;
+    private static final Map<String, Double> FALLBACK_RATES = new HashMap<>();
+    static {
+        FALLBACK_RATES.put("USD", 1.0); FALLBACK_RATES.put("EUR", 0.9165);
+        FALLBACK_RATES.put("GBP", 0.7923); FALLBACK_RATES.put("JPY", 147.88);
+        FALLBACK_RATES.put("CAD", 1.352); FALLBACK_RATES.put("AUD", 1.518);
+        FALLBACK_RATES.put("CHF", 0.882); FALLBACK_RATES.put("CNY", 7.193);
+        FALLBACK_RATES.put("RUB", 91.45);
+    }
+    private static final Map<Character, String> SYMBOL_MAP = Map.of('$', "USD", '€', "EUR", '£', "GBP", '¥', "JPY");
+    
+    private static List<HistoryEntry> history = new ArrayList<>();
+    private static Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    
+    static class CacheData { long timestamp; Map<String, Double> rates; }
+    static class HistoryEntry { long timestamp; String fromCurr, toCurr; double amount, result, rate; }
+    
+    static String detectCurrencyFromSymbol(String s) {
+        if (s.isEmpty()) return null;
+        char c = s.charAt(0);
+        return SYMBOL_MAP.get(c);
+    }
+    
+    static class Parsed { Double amount; String currency; }
+    static Parsed parseAmountCurrency(String s) {
+        Parsed p = new Parsed();
+        String curr = detectCurrencyFromSymbol(s);
+        if (curr != null) {
+            try { p.amount = Double.parseDouble(s.substring(1)); p.currency = curr; return p; }
+            catch (NumberFormatException e) {}
+        }
+        try { p.amount = Double.parseDouble(s); return p; }
+        catch (NumberFormatException e) { p.currency = s.toUpperCase(); return p; }
+    }
+    
+    static Map<String, Double> fetchRates() throws IOException {
+        File f = new File(CACHE_FILE);
+        if (f.exists()) {
+            try (Reader r = new FileReader(f)) {
+                CacheData cache = gson.fromJson(r, CacheData.class);
+                if (System.currentTimeMillis() - cache.timestamp < CACHE_TTL_MS) {
+                    System.err.println("[cache] using cached rates");
+                    return cache.rates;
+                }
+            } catch (Exception ignored) {}
+        }
+        URL url = new URL("https://api.exchangerate-api.com/v4/latest/USD");
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(5000);
+        if (conn.getResponseCode() == 200) {
+            try (Reader reader = new InputStreamReader(conn.getInputStream())) {
+                Map<String, Object> resp = gson.fromJson(reader, new TypeToken<Map<String, Object>>(){}.getType());
+                Map<String, Double> rates = (Map<String, Double>) resp.get("rates");
+                CacheData cache = new CacheData();
+                cache.timestamp = System.currentTimeMillis();
+                cache.rates = rates;
+                try (Writer w = new FileWriter(CACHE_FILE)) { gson.toJson(cache, w); }
+                System.err.println("[api] rates updated");
+                return rates;
+            }
+        }
+        System.err.println("[warn] using fallback rates");
+        return new HashMap<>(FALLBACK_RATES);
+    }
+    
+    static double[] convert(double amount, String fromCurr, String toCurr, Map<String, Double> rates) {
+        if (!rates.containsKey(fromCurr) || !rates.containsKey(toCurr))
+            throw new IllegalArgumentException("Unsupported currency");
+        double rate = rates.get(toCurr) / rates.get(fromCurr);
+        return new double[]{amount * rate, rate};
+    }
+    
+    static void addToHistory(HistoryEntry e) { history.add(0, e); if (history.size() > HISTORY_SIZE) history.remove(HISTORY_SIZE); }
+    static void showHistory() {
+        if (history.isEmpty()) { System.out.println("История пуста"); return; }
+        for (int i = 0; i < history.size(); i++) {
+            HistoryEntry e = history.get(i);
+            System.out.printf("%d) %s | %.2f %s → %s = %.4f (курс %.4f)%n",
+                i+1, Instant.ofEpochMilli(e.timestamp), e.amount, e.fromCurr, e.toCurr, e.result, e.rate);
+        }
+    }
+    
+    static void formatOutput(double amount, String fromCurr, String toCurr, double result, double rate, String fmt) {
+        if ("json".equals(fmt)) {
+            Map<String, Object> out = Map.of("amount", amount, "from", fromCurr, "to", toCurr, "result", result, "rate", rate);
+            System.out.println(gson.toJson(out));
+        } else if ("table".equals(fmt)) {
+            System.out.printf("%5s → %5s : %.2f = %.4f (курс %.4f)%n", fromCurr, toCurr, amount, result, rate);
+        } else {
+            System.out.printf("%.2f %s = %.4f %s (курс: %.4f)%n", amount, fromCurr, result, toCurr, rate);
+        }
+    }
+    
+    static void interactive(Map<String, Double> rates, Scanner scanner) {
+        System.out.println("Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit");
+        while (true) {
+            System.out.print("> ");
+            String line = scanner.nextLine().trim();
+            if (line.equals("exit")) break;
+            if (line.equals("history")) { showHistory(); continue; }
+            String[] parts = line.split("\\s+");
+            if (parts.length < 3) { System.out.println("Формат: <сумма> <из> <в>"); continue; }
+            Parsed p = parseAmountCurrency(parts[0]);
+            if (p.amount == null) { System.out.println("Неверная сумма"); continue; }
+            String fromCurr = p.currency != null ? p.currency : parts[1].toUpperCase();
+            String toCurr = parts[2].toUpperCase();
+            try {
+                double[] res = convert(p.amount, fromCurr, toCurr, rates);
+                formatOutput(p.amount, fromCurr, toCurr, res[0], res[1], "text");
+                HistoryEntry e = new HistoryEntry();
+                e.timestamp = System.currentTimeMillis();
+                e.fromCurr = fromCurr; e.toCurr = toCurr; e.amount = p.amount; e.result = res[0]; e.rate = res[1];
+                addToHistory(e);
+            } catch (Exception e) { System.out.println("Ошибка: " + e.getMessage()); }
+        }
+    }
+    
+    public static void main(String[] args) throws IOException {
+        List<String> argList = new ArrayList<>(Arrays.asList(args));
+        String format = "text";
+        boolean interactiveMode = false;
+        for (Iterator<String> it = argList.iterator(); it.hasNext(); ) {
+            String a = it.next();
+            if (a.equals("--json")) { format = "json"; it.remove(); }
+            else if (a.equals("--table")) { format = "table"; it.remove(); }
+            else if (a.equals("interactive")) { interactiveMode = true; it.remove(); }
+        }
+        Map<String, Double> rates = fetchRates();
+        Scanner scanner = new Scanner(System.in);
+        if (interactiveMode) { interactive(rates, scanner); return; }
+        if (argList.size() < 3) {
+            System.err.println("Usage: java Converter [--json|--table] <amount> <from> <to>   or   Converter interactive");
+            System.exit(1);
+        }
+        Parsed p = parseAmountCurrency(argList.get(0));
+        if (p.amount == null) { System.err.println("Invalid amount"); System.exit(1); }
+        String fromCurr = p.currency != null ? p.currency : argList.get(1).toUpperCase();
+        String toCurr = argList.get(2).toUpperCase();
+        try {
+            double[] res = convert(p.amount, fromCurr, toCurr, rates);
+            formatOutput(p.amount, fromCurr, toCurr, res[0], res[1], format);
+            HistoryEntry e = new HistoryEntry(); e.timestamp = System.currentTimeMillis();
+            e.fromCurr = fromCurr; e.toCurr = toCurr; e.amount = p.amount; e.result = res[0]; e.rate = res[1];
+            addToHistory(e);
+        } catch (Exception e) { System.err.println("Error: " + e.getMessage()); System.exit(1); }
+    }
+}
