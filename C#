@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Linq;
+
+namespace CurrencyConverter
+{
+    class CacheData { public long Timestamp { get; set; } public Dictionary<string, double> Rates { get; set; } }
+    class HistoryEntry { public long Timestamp { get; set; } public string FromCurr { get; set; } public string ToCurr { get; set; } public double Amount { get; set; } public double Result { get; set; } public double Rate { get; set; } }
+
+    class Program
+    {
+        const string CACHE_FILE = ".cache.json";
+        static readonly TimeSpan CACHE_TTL = TimeSpan.FromHours(1);
+        const int HISTORY_SIZE = 10;
+        static readonly Dictionary<string, double> FALLBACK_RATES = new()
+        {
+            ["USD"] = 1, ["EUR"] = 0.9165, ["GBP"] = 0.7923, ["JPY"] = 147.88,
+            ["CAD"] = 1.352, ["AUD"] = 1.518, ["CHF"] = 0.882, ["CNY"] = 7.193, ["RUB"] = 91.45
+        };
+        static readonly Dictionary<char, string> SYMBOL_MAP = new() { { '$', "USD" }, { '€', "EUR" }, { '£', "GBP" }, { '¥', "JPY" } };
+        
+        static List<HistoryEntry> history = new();
+        
+        static string DetectCurrencyFromSymbol(string s) => s.Length > 0 && SYMBOL_MAP.ContainsKey(s[0]) ? SYMBOL_MAP[s[0]] : null;
+        
+        static (double? Amount, string Currency) ParseAmountCurrency(string s)
+        {
+            var curr = DetectCurrencyFromSymbol(s);
+            if (curr != null && double.TryParse(s[1..], out double amt)) return (amt, curr);
+            if (double.TryParse(s, out double num)) return (num, null);
+            return (null, s.ToUpper());
+        }
+        
+        static async Task<Dictionary<string, double>> FetchRatesAsync()
+        {
+            if (File.Exists(CACHE_FILE))
+            {
+                var json = await File.ReadAllTextAsync(CACHE_FILE);
+                var cache = JsonSerializer.Deserialize<CacheData>(json);
+                if (cache != null && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - cache.Timestamp < CACHE_TTL.TotalMilliseconds)
+                {
+                    Console.Error.WriteLine("[cache] using cached rates");
+                    return cache.Rates;
+                }
+            }
+            using var http = new HttpClient();
+            http.Timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                var resp = await http.GetAsync("https://api.exchangerate-api.com/v4/latest/USD");
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync();
+                    var doc = JsonDocument.Parse(json);
+                    var ratesDict = new Dictionary<string, double>();
+                    foreach (var prop in doc.RootElement.GetProperty("rates").EnumerateObject())
+                        ratesDict[prop.Name] = prop.Value.GetDouble();
+                    var cache = new CacheData { Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Rates = ratesDict };
+                    await File.WriteAllTextAsync(CACHE_FILE, JsonSerializer.Serialize(cache, new JsonSerializerOptions { WriteIndented = true }));
+                    Console.Error.WriteLine("[api] rates updated");
+                    return ratesDict;
+                }
+            }
+            catch { }
+            Console.Error.WriteLine("[warn] using fallback rates");
+            return new Dictionary<string, double>(FALLBACK_RATES);
+        }
+        
+        static (double Result, double Rate) Convert(double amount, string fromCurr, string toCurr, Dictionary<string, double> rates)
+        {
+            if (!rates.ContainsKey(fromCurr) || !rates.ContainsKey(toCurr))
+                throw new ArgumentException($"Unsupported currency: {fromCurr} or {toCurr}");
+            double rate = rates[toCurr] / rates[fromCurr];
+            return (amount * rate, rate);
+        }
+        
+        static void AddToHistory(HistoryEntry e) { history.Insert(0, e); if (history.Count > HISTORY_SIZE) history.RemoveAt(HISTORY_SIZE); }
+        static void ShowHistory()
+        {
+            if (history.Count == 0) { Console.WriteLine("История пуста"); return; }
+            for (int i = 0; i < history.Count; i++)
+            {
+                var e = history[i];
+                var dt = DateTimeOffset.FromUnixTimeMilliseconds(e.Timestamp).LocalDateTime.ToString("HH:mm:ss");
+                Console.WriteLine($"{i+1}) {dt} | {e.Amount:F2} {e.FromCurr} → {e.ToCurr} = {e.Result:F4} (курс {e.Rate:F4})");
+            }
+        }
+        
+        static void FormatOutput(double amount, string fromCurr, string toCurr, double result, double rate, string format)
+        {
+            if (format == "json")
+            {
+                var obj = new { amount, from = fromCurr, to = toCurr, result = Math.Round(result,4), rate = Math.Round(rate,4) };
+                Console.WriteLine(JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true }));
+            }
+            else if (format == "table")
+                Console.WriteLine($"{fromCurr,5} → {toCurr,5} : {amount:F2} = {result:F4} (курс {rate:F4})");
+            else
+                Console.WriteLine($"{amount:F2} {fromCurr} = {result:F4} {toCurr} (курс: {rate:F4})");
+        }
+        
+        static async Task Interactive(Dictionary<string, double> rates)
+        {
+            Console.WriteLine("Интерактивный конвертер. Команды: <сумма> <из> <в>, history, exit");
+            while (true)
+            {
+                Console.Write("> ");
+                string line = Console.ReadLine()?.Trim();
+                if (line == "exit") break;
+                if (line == "history") { ShowHistory(); continue; }
+                var parts = line?.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts == null || parts.Length < 3) { Console.WriteLine("Формат: <сумма> <из> <в>"); continue; }
+                var (amount, detectedCurr) = ParseAmountCurrency(parts[0]);
+                if (amount == null) { Console.WriteLine("Неверная сумма"); continue; }
+                string fromCurr = detectedCurr ?? parts[1].ToUpper();
+                string toCurr = parts[2].ToUpper();
+                try
+                {
+                    var (result, rate) = Convert(amount.Value, fromCurr, toCurr, rates);
+                    FormatOutput(amount.Value, fromCurr, toCurr, result, rate, "text");
+                    AddToHistory(new HistoryEntry { Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), FromCurr = fromCurr, ToCurr = toCurr, Amount = amount.Value, Result = result, Rate = rate });
+                }
+                catch (Exception e) { Console.WriteLine($"Ошибка: {e.Message}"); }
+            }
+        }
+        
+        static async Task Main(string[] args)
+        {
+            var argList = args.ToList();
+            string format = "text";
+            bool interactiveMode = false;
+            for (int i = 0; i < argList.Count; i++)
+            {
+                if (argList[i] == "--json") { format = "json"; argList.RemoveAt(i--); }
+                else if (argList[i] == "--table") { format = "table"; argList.RemoveAt(i--); }
+                else if (argList[i] == "interactive") { interactiveMode = true; argList.RemoveAt(i--); }
+            }
+            var rates = await FetchRatesAsync();
+            if (interactiveMode) { await Interactive(rates); return; }
+            if (argList.Count < 3)
+            {
+                Console.Error.WriteLine("Usage: dotnet run [--json|--table] <amount> <from> <to>   or   dotnet run interactive");
+                Environment.Exit(1);
+            }
+            var (amount, detected) = ParseAmountCurrency(argList[0]);
+            if (amount == null) { Console.Error.WriteLine("Invalid amount"); Environment.Exit(1); }
+            string fromCurr = detected ?? argList[1].ToUpper();
+            string toCurr = argList[2].ToUpper();
+            try
+            {
+                var (result, rate) = Convert(amount.Value, fromCurr, toCurr, rates);
+                FormatOutput(amount.Value, fromCurr, toCurr, result, rate, format);
+                AddToHistory(new HistoryEntry { Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), FromCurr = fromCurr, ToCurr = toCurr, Amount = amount.Value, Result = result, Rate = rate });
+            }
+            catch (Exception e) { Console.Error.WriteLine($"Error: {e.Message}"); Environment.Exit(1); }
+        }
+    }
+}
